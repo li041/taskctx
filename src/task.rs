@@ -120,6 +120,60 @@ pub struct SchedStatus {
     pub priority: usize,
 }
 
+const __CPU_SETSIZE: usize = 1024;
+const __NCPUBITS: usize = 8 * core::mem::size_of::<usize>();
+
+/// CpuSet represent a bit-mask of CPUs
+/// used by sys_sched_setaffinity and sys_sched_getaffinity
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CpuSet {
+    bits: [usize; __CPU_SETSIZE / __NCPUBITS],
+}
+
+const SMP: usize = 1;
+/// 最多1024个CPU
+impl CpuSet {
+    /// Create a new and emtpy CpuSet
+    pub fn new() -> Self {
+        Self { bits: [0; __CPU_SETSIZE / __NCPUBITS] }
+    }
+    pub fn ones(max_cpu_num: usize) -> CpuSet {
+        let mut cpu_set = Self::new();
+        for i in 0..max_cpu_num {
+            cpu_set.set(i);
+        }
+        return cpu_set;
+    }
+    pub fn set(&mut self, cpu: usize) {
+        self.bits[cpu / __NCPUBITS] |= 1 << (cpu % __NCPUBITS);
+    } 
+    /// Clear all bits in the CPU set
+    pub fn zero(&mut self) {
+        for i in 0..__CPU_SETSIZE / __NCPUBITS {
+            self.bits[i] = 0;
+        }
+    }
+    /// remove cpu from the CPU set
+    pub fn clr(&mut self, cpu: usize) {
+        self.bits[cpu / __NCPUBITS] &= !(1 << (cpu % __NCPUBITS));
+    }
+    /// Test whether cpu is a member of the CPU set
+    pub fn isset(&self, cpu: usize) -> bool {
+        self.bits[cpu / __NCPUBITS] & (1 << (cpu % __NCPUBITS)) != 0
+    }
+    pub fn and(&mut self, other: &CpuSet) {
+        for i in 0..__CPU_SETSIZE / __NCPUBITS {
+            self.bits[i] &= other.bits[i];
+        }
+    } 
+    pub fn or(&mut self, other: &CpuSet) {
+        for i in 0..__CPU_SETSIZE / __NCPUBITS {
+            self.bits[i] |= other.bits[i];
+        }
+    }
+}
+
 /// The inner task structure used as the minimal unit of scheduling.
 pub struct TaskInner {
     id: TaskId,
@@ -199,7 +253,7 @@ pub struct TaskInner {
     /// TODO: to support the sched_setaffinity
     ///
     /// TODO: move to the upper layer
-    pub cpu_set: AtomicU64,
+    pub cpu_set: UnsafeCell<CpuSet>,
 
     #[cfg(feature = "monolithic")]
     /// 退出时是否向父进程发送SIG_CHILD
@@ -476,18 +530,27 @@ impl TaskInner {
 
     /// 设置CPU set，其中set_size为bytes长度
     pub fn set_cpu_set(&self, mask: usize, set_size: usize, max_cpu_num: usize) {
+        /* 
         let len = if set_size * 4 > max_cpu_num {
             max_cpu_num
         } else {
             set_size * 4
         };
-        let now_mask = mask & 1 << ((len) - 1);
-        self.cpu_set.store(now_mask as u64, Ordering::Release)
+        */
+        let physical_cpu_set: CpuSet = CpuSet::ones(max_cpu_num);
+        // let now_mask = mask & 1 << ((len) - 1);
+        //self.cpu_set.store(now_mask as u64, Ordering::Release)
+        unsafe {
+            self.cpu_set.get().as_mut().unwrap().and(&physical_cpu_set);
+        }
     }
 
     /// to get the CPU set
     pub fn get_cpu_set(&self) -> usize {
-        self.cpu_set.load(Ordering::Acquire) as usize
+        // self.cpu_set.load(Ordering::Acquire) as usize
+        unsafe {
+            *self.cpu_set.get()
+        } 
     }
 
     /// set the scheduling policy and priority
@@ -581,7 +644,7 @@ impl TaskInner {
 
             #[cfg(feature = "monolithic")]
             // 一开始默认都可以运行在每个CPU上
-            cpu_set: AtomicU64::new(0),
+            cpu_set: AtomicU64::new(CpuSet::ones(SMP)),
 
             #[cfg(feature = "monolithic")]
             sched_status: UnsafeCell::new(SchedStatus {
